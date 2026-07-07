@@ -1,0 +1,9 @@
+cache/
+__pycache__/
+*.npy
+venv/
+*.pyc
+.pytest_cache/
+data/
+.DS_Store
+.claude/

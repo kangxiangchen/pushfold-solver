@@ -1,0 +1,5 @@
+eval7
+numpy
+matplotlib
+tqdm
+pytest
