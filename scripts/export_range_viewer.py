@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Export the solved 4-max ranges as a single self-contained interactive HTML viewer.
+"""Export the solved 4-max ranges as a self-contained interactive HTML viewer.
 
 The production PNG (viz.plot_fourmax_ranges) crams all 14 heatmaps into one image --
-fine as a record, useless for quick reference. This script emits
-cache/range_viewer.html: one offline file (no CDNs, no fetches) with a tab per info
-set, a large 13x13 grid, and hover/tap detail for exact per-hand weights.
+fine as a record, useless for quick reference. This script emits two variants of the
+same page from one template:
+
+  cache/range_viewer.html   full standalone document (open locally in any browser)
+  --artifact PATH           body-only fragment for publishing as a standalone HTML artifact
+                            (the artifact host supplies the <!DOCTYPE>/<head>/<body>
+                            skeleton, so the fragment must not) -- this is the
+                            view-it-on-your-phone path.
 
 Cell encoding: each cell is filled left-to-right by its shove/call weight -- the red
 fill occupies exactly weight% of the cell width over a neutral "fold" base. That makes
@@ -12,6 +17,10 @@ mixed-strategy cells readable at a glance (a 30% call literally looks 30% full) 
 unlike the PNG's red-yellow-green interpolation, doesn't rely on a red-vs-green hue
 pair (the classic colorblind-unsafe combination): the value is carried by geometry,
 color just makes it pop. Red still means shove/call, matching the PNG's salient half.
+
+Theming is token-level: palette custom properties on :root, redefined under
+@media (prefers-color-scheme: dark) AND under :root[data-theme="dark"|"light"] so the
+artifact viewer's manual theme toggle overrides the OS preference in both directions.
 
 Rerun after any re-solve: python scripts/export_range_viewer.py
 """
@@ -78,66 +87,77 @@ def build_payload(pkl_path: str) -> dict:
     return {"labels": labels, "infosets": infosets, "meta": " · ".join(meta_bits)}
 
 
-# One self-contained page. Colors are the dataviz reference palette's validated steps
-# (shove red 3.85:1 light / 5.39:1 dark vs surface; all label inks >= 3.9:1 on their
-# fills) declared once as CSS custom properties, with dark mode as its own selected set.
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>4-max push/fold ranges</title>
-<style>
-:root {
+# Palette: the dataviz reference tokens validated for this viewer (shove red 3.85:1
+# light / 5.39:1 dark vs surface; all label inks >= 3.9:1 on their fills). Defined
+# once per mode and interpolated into :root, the dark media query, and both
+# data-theme override blocks so the artifact theme toggle wins in either direction.
+LIGHT_VARS = """\
   --surface: #fcfcfb; --page: #f9f9f7;
   --ink: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
   --hairline: #e1e0d9; --ring: rgba(11,11,11,0.10);
   --fold: #f0efec; --shove: #e34948; --shove-ink: #ffffff;
-  --tab-active: #0b0b0b; --tab-active-ink: #fcfcfb;
+  --tab-active: #0b0b0b; --tab-active-ink: #fcfcfb;"""
+
+DARK_VARS = """\
+  --surface: #1a1a19; --page: #0d0d0d;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+  --hairline: #2c2c2a; --ring: rgba(255,255,255,0.10);
+  --fold: #383835; --shove: #e66767; --shove-ink: #0b0b0b;
+  --tab-active: #ffffff; --tab-active-ink: #0d0d0d;"""
+
+# The page content: everything inside <body>, wrapped in #rv-root rather than styling
+# <body> itself, so the same markup drops cleanly into the artifact host's skeleton.
+PAGE_CONTENT = """<style>
+:root {
+__LIGHT_VARS__
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --surface: #1a1a19; --page: #0d0d0d;
-    --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
-    --hairline: #2c2c2a; --ring: rgba(255,255,255,0.10);
-    --fold: #383835; --shove: #e66767; --shove-ink: #0b0b0b;
-    --tab-active: #ffffff; --tab-active-ink: #0d0d0d;
-  }
+@media (prefers-color-scheme: dark) { :root {
+__DARK_VARS__
+} }
+:root[data-theme="light"] {
+__LIGHT_VARS__
 }
-* { box-sizing: border-box; margin: 0; }
-body {
+:root[data-theme="dark"] {
+__DARK_VARS__
+}
+#rv-root, #rv-root * { box-sizing: border-box; margin: 0; }
+#rv-root {
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--page); color: var(--ink);
   display: flex; min-height: 100vh;
 }
-nav {
+#rv-root nav {
   width: 232px; flex: none; padding: 16px 10px 24px;
   border-right: 1px solid var(--hairline); overflow-y: auto;
 }
-nav h1 { font-size: 15px; padding: 2px 8px 10px; }
-nav .seat { font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+#rv-root nav h1 { font-size: 15px; padding: 2px 8px 10px; }
+#rv-root nav .seat { font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
   color: var(--ink-muted); text-transform: uppercase; padding: 12px 8px 4px; }
-nav button {
+#rv-root nav button {
   display: flex; justify-content: space-between; gap: 8px; width: 100%;
   padding: 6px 8px; margin: 1px 0; border: 0; border-radius: 6px;
   background: none; color: var(--ink-2); font: inherit; font-size: 13px;
   text-align: left; cursor: pointer;
 }
-nav button:hover { background: var(--fold); }
-nav button.active { background: var(--tab-active); color: var(--tab-active-ink); }
-nav button .pct { font-variant-numeric: tabular-nums; opacity: 0.75; }
-main { flex: 1; padding: 22px 28px; min-width: 0; }
-header h2 { font-size: 18px; }
-header .key { color: var(--ink-muted); font-size: 13px; margin-top: 2px; }
-header .stat { margin-top: 6px; font-size: 14px; color: var(--ink-2); }
-header .stat b { color: var(--ink); font-size: 16px; }
+#rv-root nav button:hover { background: var(--fold); }
+#rv-root nav button:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+#rv-root nav button.active { background: var(--tab-active); color: var(--tab-active-ink); }
+#rv-root nav button .pct { font-variant-numeric: tabular-nums; opacity: 0.75; }
+#rv-root main { flex: 1; padding: 22px 28px; min-width: 0; }
+#rv-root header h2 { font-size: 18px; }
+#rv-root header .key { color: var(--ink-muted); font-size: 13px; margin-top: 2px; }
+#rv-root header .stat { margin-top: 6px; font-size: 14px; color: var(--ink-2); }
+#rv-root header .stat b { color: var(--ink); font-size: 16px; }
 #wrap { margin-top: 18px; max-width: 720px; }
 #grid {
-  display: grid; grid-template-columns: 20px repeat(13, 1fr);
+  /* minmax(0,1fr) not bare 1fr: with aspect-ratio cells, 1fr's implicit auto
+     minimum gives tracks a floor that overflows narrow viewports. */
+  display: grid; grid-template-columns: 20px repeat(13, minmax(0, 1fr));
   gap: 2px; background: var(--surface); padding: 10px;
   border: 1px solid var(--ring); border-radius: 10px;
 }
-.hdr { display: flex; align-items: center; justify-content: center;
+.cell, #grid .hdr { min-width: 0; }
+#grid .hdr { display: flex; align-items: center; justify-content: center;
   font-size: 11px; color: var(--ink-muted); }
 .cell {
   position: relative; aspect-ratio: 1; border-radius: 4px;
@@ -150,24 +170,38 @@ header .stat b { color: var(--ink); font-size: 16px; }
   font-size: clamp(8px, 1.15vw, 12px); font-weight: 600; color: var(--ink-2); }
 .cell.hi span { color: var(--shove-ink); }
 .cell span small { font-weight: 500; font-size: 0.8em; opacity: 0.85; }
-.cell:hover { outline: 2px solid var(--ink); outline-offset: -2px; z-index: 1; }
+.cell:hover, .cell.sel { outline: 2px solid var(--ink); outline-offset: -2px; z-index: 1; }
 #detail { margin-top: 10px; min-height: 22px; font-size: 14px; color: var(--ink-2); }
 #detail b { color: var(--ink); }
-#legend { display: flex; gap: 18px; align-items: center; margin-top: 8px;
-  font-size: 12px; color: var(--ink-muted); }
+#legend { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center;
+  margin-top: 8px; font-size: 12px; color: var(--ink-muted); }
 #legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px;
   margin-right: 5px; vertical-align: -2px; border: 1px solid var(--ring); }
-footer { margin-top: 14px; font-size: 12px; color: var(--ink-muted); }
+#rv-root footer { margin-top: 14px; font-size: 12px; color: var(--ink-muted); }
 @media (max-width: 760px) {
-  body { flex-direction: column; }
-  nav { width: auto; border-right: 0; border-bottom: 1px solid var(--hairline);
-    display: flex; flex-wrap: wrap; gap: 2px; }
-  nav h1, nav .seat { width: 100%; }
-  nav button { width: auto; }
+  #rv-root { flex-direction: column; }
+  /* Nav becomes a sticky, thumb-scrollable chip strip. */
+  #rv-root nav {
+    width: auto; display: flex; flex-wrap: nowrap; align-items: center; gap: 4px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    position: sticky; top: 0; z-index: 2;
+    padding: 8px 10px; background: var(--page);
+    border-right: 0; border-bottom: 1px solid var(--hairline);
+  }
+  #rv-root nav h1 { display: none; }
+  #rv-root nav .seat { flex: none; padding: 0 2px 0 8px; }
+  #rv-root nav button {
+    flex: none; width: auto; border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 6px 11px; white-space: nowrap;
+  }
+  #rv-root main { padding: 14px 12px 24px; }
+  #grid { gap: 1px; padding: 6px; grid-template-columns: 15px repeat(13, minmax(0, 1fr)); }
+  #grid .hdr { font-size: 9px; }
+  .cell span { font-size: clamp(6.5px, 2.1vw, 11px); }
+  .cell { border-radius: 3px; }
 }
 </style>
-</head>
-<body>
+<div id="rv-root">
 <nav id="nav"><h1>4-max push/fold</h1></nav>
 <main>
   <header>
@@ -177,7 +211,7 @@ footer { margin-top: 14px; font-size: 12px; color: var(--ink-muted); }
   </header>
   <div id="wrap">
     <div id="grid"></div>
-    <div id="detail">Hover a hand for exact weight.</div>
+    <div id="detail">Tap or hover a hand for its exact weight.</div>
     <div id="legend">
       <span><span class="sw" style="background:var(--shove)"></span>shove / call (fill = weight)</span>
       <span><span class="sw" style="background:var(--fold)"></span>fold</span>
@@ -186,13 +220,15 @@ footer { margin-top: 14px; font-size: 12px; color: var(--ink-muted); }
     <footer id="meta"></footer>
   </div>
 </main>
+</div>
 <script>
 const DATA = __DATA__;
 const RANKS = "AKQJT98765432";
 const nav = document.getElementById("nav");
 let current = 0;
+let selectedCell = null;
 
-// Sidebar: tabs grouped by seat, each showing its aggregate shove/call %.
+// Sidebar (desktop) / chip strip (mobile): tabs grouped by seat, with shove/call %.
 let lastSeat = null;
 DATA.infosets.forEach((is, i) => {
   if (is.seat !== lastSeat) {
@@ -214,8 +250,10 @@ function comboInfo(r, c) {
 
 function select(i) {
   current = i;
+  selectedCell = null;
   const is = DATA.infosets[i];
   tabs.forEach((t, j) => t.classList.toggle("active", j === i));
+  tabs[i].scrollIntoView({ block: "nearest", inline: "nearest" });
   document.getElementById("desc").textContent = is.desc;
   document.getElementById("key").textContent = "info set " + is.key;
   document.getElementById("pct").textContent = is.shovePct.toFixed(1) + "%";
@@ -234,7 +272,14 @@ function select(i) {
       cell.innerHTML = `<div class="fill"></div><span>${label}${
         mixed ? `<small>${Math.round(w * 100)}%</small>` : ""}</span>`;
       cell.onmouseenter = () => showDetail(label, w, r, c, is.action);
-      cell.onclick = () => showDetail(label, w, r, c, is.action);
+      // Tap keeps the cell outlined until another is tapped -- persistent selection
+      // feedback for touch, where there's no hover state.
+      cell.onclick = () => {
+        if (selectedCell) selectedCell.classList.remove("sel");
+        cell.classList.add("sel");
+        selectedCell = cell;
+        showDetail(label, w, r, c, is.action);
+      };
       grid.appendChild(cell);
     }
   }
@@ -254,23 +299,56 @@ document.addEventListener("keydown", e => {
 
 document.getElementById("meta").textContent = DATA.meta;
 select(0);
-</script>
+</script>"""
+
+TITLE = "4-max Push/Fold Ranges"
+
+LOCAL_WRAPPER = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{TITLE}</title>
+</head>
+<body>
+__CONTENT__
 </body>
 </html>
 """
+
+
+def render(payload: dict) -> str:
+    content = (
+        PAGE_CONTENT
+        .replace("__LIGHT_VARS__", LIGHT_VARS)
+        .replace("__DARK_VARS__", DARK_VARS)
+        .replace("__DATA__", json.dumps(payload, separators=(",", ":")))
+    )
+    return content
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ranges", default="cache/fourmax_ranges.pkl")
     parser.add_argument("--out", default="cache/range_viewer.html")
+    parser.add_argument("--artifact", default=None, metavar="PATH",
+                        help="also write a body-only fragment (with inline <title>) for "
+                             "publishing as a standalone HTML artifact")
     args = parser.parse_args()
 
     payload = build_payload(args.ranges)
-    html = HTML_TEMPLATE.replace("__DATA__", json.dumps(payload, separators=(",", ":")))
+    content = render(payload)
+
+    html = LOCAL_WRAPPER.replace("__CONTENT__", content)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(html)
     print(f"wrote {args.out} ({len(html) // 1024} KB, {len(payload['infosets'])} info sets)")
+
+    if args.artifact:
+        fragment = f"<title>{TITLE}</title>\n" + content
+        Path(args.artifact).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.artifact).write_text(fragment)
+        print(f"wrote {args.artifact} (artifact fragment, {len(fragment) // 1024} KB)")
 
 
 if __name__ == "__main__":
