@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 import cards
@@ -46,6 +45,9 @@ def plot_range_heatmap(range_vec: np.ndarray, title: str, ax=None, cmap: str = "
     """Cell color = shove/call weight in [0,1] (0=fold, 1=shove/call, continuous
     colormap doubles as the mixed-strategy encoding for fractional weights). Cell
     text = canonical label, e.g. 'AKs'."""
+    import matplotlib.pyplot as plt  # lazy: keeps range_to_grid/_GRID_CANON_INDEX (pure
+
+    # numpy, reused by the HTML viewer and dashboards) importable without matplotlib.
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
@@ -81,6 +83,7 @@ def plot_hu_ranges(ranges: dict, cfg, out_dir: str = "cache/") -> str:
     side by side, saved as one PNG. The only HU-specific function in this module --
     range_to_grid/plot_range_heatmap are fully general and get reused unchanged for
     4-max's 14 heatmaps later."""
+    import matplotlib.pyplot as plt  # lazy -- see plot_range_heatmap
     fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))
     plot_range_heatmap(ranges["SB|"], "SB open-shove range", ax=axes[0])
     plot_range_heatmap(ranges["BB|SB"], "BB call-vs-SB range", ax=axes[1])
@@ -106,6 +109,8 @@ def plot_fourmax_ranges(ranges: dict, cfg, out_dir: str = "cache/") -> str:
         by_seat.setdefault(infoset.seat, []).append(infoset)
     for seat_infosets in by_seat.values():
         seat_infosets.sort(key=lambda i: len(i.shoved_before))
+
+    import matplotlib.pyplot as plt  # lazy -- see plot_range_heatmap
 
     seats = list(cfg.seats)
     max_cols = max(len(v) for v in by_seat.values())

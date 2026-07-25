@@ -49,6 +49,7 @@ HU vs 4-max are two genuinely different numerical regimes, and `solve()` support
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,17 @@ class SolverConfig:
     log_every: int = 200  # emit a progress log line (iteration, alpha, max_delta,
     # avg_range_drift) every this many sweeps; 0 disables logging.
 
+    # --- 9-max tractability (default off => single-core, exact per-pot MC, unchanged) ---
+    n_workers: int = 1  # parallelize each sweep's per-info-set best responses across this
+    # many processes. The info-set best responses are independent given the frozen ranges
+    # snapshot, so this is a near-linear speedup (bounded by cores). 1 = the original
+    # single-process path, byte-for-byte. Only worth it for the 510-info-set 9-max game.
+    mc_iterations_deep: int | None = None  # cap MC samples for deep (>= deep_opponent_
+    # threshold live opponents) multiway pots at this count instead of mc_iterations. Deep
+    # all-ins are the priciest to sample and, at tight 5bb ranges, rare -- so a coarse
+    # equity for them is cheap and barely moves the EV. None = exact mc_iterations for all.
+    deep_opponent_threshold: int = 4  # a pot is "deep" at or above this many live opponents.
+
 
 def shove_ev_net(
     cfg: GameConfig,
@@ -136,13 +148,20 @@ def shove_ev_net(
     evaluator: equity.Evaluator | None = None,
     mc_iterations: int = 150,
     rng: np.random.Generator | None = None,
+    mc_cache: dict | None = None,
+    mc_iterations_deep: int | None = None,
+    deep_threshold: int = 4,
 ) -> tuple[np.ndarray, float]:
     """(ev_shove_vector, fold_payoff) for every one of the 169 hands at this info
     set, given the CURRENT ranges. Shared by best_response and the exploitability
     diagnostic so both dispatch identically. Both halves are fully general over any
-    info-set shape -- see ev.shove_ev_net_vec / ev.fold_baseline_ev_net."""
+    info-set shape -- see ev.shove_ev_net_vec / ev.fold_baseline_ev_net. `mc_cache` (a
+    per-sweep multiway-equity memo) and `mc_iterations_deep`/`deep_threshold` (capped MC
+    for rare deep pots) are passed straight through to ev.shove_ev_net_vec."""
     ev_shove = ev.shove_ev_net_vec(
-        cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations, rng=rng
+        cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations,
+        rng=rng, mc_cache=mc_cache, mc_iterations_deep=mc_iterations_deep,
+        deep_threshold=deep_threshold,
     )
     fold_payoff = ev.fold_baseline_ev_net(cfg, infoset, ranges)
     return ev_shove, fold_payoff
@@ -156,12 +175,17 @@ def best_response(
     evaluator: equity.Evaluator | None = None,
     mc_iterations: int = 150,
     rng: np.random.Generator | None = None,
+    mc_cache: dict | None = None,
+    mc_iterations_deep: int | None = None,
+    deep_threshold: int = 4,
 ) -> np.ndarray:
     """Pure best response per hand: 1.0 (shove/call) if EV beats folding, 0.0 if it
     doesn't, 0.5 only at an exact tie. In practice, damping (not this tolerance) is
     what reveals genuinely mixed hands -- see module docstring."""
     ev_shove, fold_payoff = shove_ev_net(
-        cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations, rng=rng
+        cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations,
+        rng=rng, mc_cache=mc_cache, mc_iterations_deep=mc_iterations_deep,
+        deep_threshold=deep_threshold,
     )
     return np.where(
         ev_shove > fold_payoff + _TIE_TOLERANCE,
@@ -182,17 +206,24 @@ def compute_exploitability(
     evaluator: equity.Evaluator | None = None,
     mc_iterations: int = 150,
     rng: np.random.Generator | None = None,
+    mc_cache: dict | None = None,
+    mc_iterations_deep: int | None = None,
+    deep_threshold: int = 4,
 ) -> float:
     """Combo-weighted EV gain, summed over info sets, from switching each seat's
     CURRENT (possibly mixed) range to a pure best response against the others'
     current ranges. Zero at a true fixed point; reported as a diagnostic, not gated
-    on, per spec ("optionally also require... exploitability < eps")."""
+    on, per spec ("optionally also require... exploitability < eps"). `mc_cache`, if
+    given, memoizes multiway equity across info sets for this single measurement (ranges
+    are fixed here), matching the per-sweep caching in solve()."""
     total_gain = 0.0
     weight = np.asarray(cards.CANON_COMBO_WEIGHT, dtype=np.float64)
     for infoset in infosets:
         key = tree.infoset_key(infoset.seat, infoset.shoved_before)
         ev_shove, fold_payoff = shove_ev_net(
-            cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations, rng=rng
+            cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations,
+            rng=rng, mc_cache=mc_cache, mc_iterations_deep=mc_iterations_deep,
+            deep_threshold=deep_threshold,
         )
         current_range = ranges[key]
         value_current = current_range * ev_shove + (1 - current_range) * fold_payoff
@@ -226,6 +257,101 @@ def _load_checkpoint(path: str) -> dict | None:
         return None
     with open(p, "rb") as f:
         return pickle.load(f)
+
+
+# --- Parallel sweep workers (used only when SolverConfig.n_workers > 1) ------------
+# Each worker process holds the read-only cfg/table/evaluator as module globals, set
+# once via the Pool initializer, so only the per-sweep `ranges` snapshot crosses the
+# process boundary. The per-info-set best responses are independent given that frozen
+# snapshot, so distributing them is a near-linear (core-bounded) speedup -- the key
+# lever that makes the 510-info-set 9-max sweep tractable.
+_WORKER: dict = {}
+
+
+def _init_worker(cfg: GameConfig, table: np.ndarray) -> None:
+    _WORKER["cfg"] = cfg
+    _WORKER["table"] = table
+    _WORKER["evaluator"] = equity.get_evaluator()  # rebuilt per process (eval7 isn't pickled)
+
+
+def _infoset_cost(
+    iset: InfoSet, n_seats: int, mc_iterations: int, mc_iterations_deep: int | None,
+    deep_threshold: int,
+) -> float:
+    """Estimated MC cost of one best response at `iset`, in units of MC iterations.
+
+    In the mixed (steady-state) regime every seat-after shoves with fractional
+    probability, so the leaf enumeration is fully live: of the s = seats-after, any
+    subset shoves, giving C(s, j) leaves with j extra shovers on top of the h already
+    committed. A leaf with n = h + j live opponents costs ~0 (steal, n=0), a cheap
+    pairwise vector op (n=1), a full-mc multiway sample (2 <= n < deep_threshold), or a
+    capped-mc sample (n >= deep_threshold). Summing C(s,j)*cost gives the true relative
+    cost -- unlike a raw 2**s leaf count, this correctly discounts the many cheap deep
+    leaves, which is what a per-leaf MC-cost-blind split got wrong (idle workers)."""
+    from math import comb
+
+    h = len(iset.shoved_before)
+    s = n_seats - 1 - iset.seat_pos
+    deep_mc = mc_iterations_deep if mc_iterations_deep is not None else mc_iterations
+    total = 0.0
+    for j in range(s + 1):
+        n = h + j
+        if n <= 0:
+            cost = 0.0
+        elif n == 1:
+            cost = 1.0  # pairwise table lookup, ~cheap vs an MC loop
+        elif n < deep_threshold:
+            cost = float(mc_iterations)
+        else:
+            cost = float(deep_mc)
+        total += comb(s, j) * cost
+    return total
+
+
+def _balanced_chunks(
+    infosets: list[InfoSet], n_seats: int, n_workers: int,
+    mc_iterations: int, mc_iterations_deep: int | None, deep_threshold: int,
+) -> list[list[InfoSet]]:
+    """Partition info sets into n_workers cost-balanced buckets (LPT bin-packing).
+
+    A sweep blocks on its heaviest bucket and per-info-set cost is hugely skewed, so a
+    naive even split by count leaves most workers idle. Weight each info set by its
+    estimated MC cost (`_infoset_cost`) and greedily place them (heaviest first) into
+    the currently-lightest bucket."""
+    def weight(iset: InfoSet) -> float:
+        return _infoset_cost(iset, n_seats, mc_iterations, mc_iterations_deep, deep_threshold)
+
+    buckets: list[list[InfoSet]] = [[] for _ in range(n_workers)]
+    loads = [0.0] * n_workers
+    for iset in sorted(infosets, key=weight, reverse=True):
+        b = min(range(n_workers), key=lambda k: loads[k])
+        buckets[b].append(iset)
+        loads[b] += weight(iset)
+    return buckets
+
+
+def _best_response_chunk(
+    infosets_chunk: list[InfoSet],
+    ranges: RangeMap,
+    mc_iterations: int,
+    mc_iterations_deep: int | None,
+    deep_threshold: int,
+    seed: int,
+) -> list[tuple[str, np.ndarray]]:
+    cfg = _WORKER["cfg"]
+    table = _WORKER["table"]
+    evaluator = _WORKER["evaluator"]
+    rng = np.random.default_rng(seed)
+    mc_cache: dict = {}
+    out: list[tuple[str, np.ndarray]] = []
+    for infoset in infosets_chunk:
+        br = best_response(
+            cfg, infoset, ranges, table, evaluator=evaluator, mc_iterations=mc_iterations,
+            rng=rng, mc_cache=mc_cache, mc_iterations_deep=mc_iterations_deep,
+            deep_threshold=deep_threshold,
+        )
+        out.append((tree.infoset_key(infoset.seat, infoset.shoved_before), br))
+    return out
 
 
 def solve(
@@ -291,54 +417,96 @@ def solve(
             logger.info("resumed 4-max solve from %s at iteration %d",
                         solver_cfg.checkpoint_path, ckpt["iteration"])
 
+    # Optional process pool for the sweep. Created once (workers reuse cfg/table/evaluator
+    # across sweeps); only the per-sweep `ranges` snapshot is shipped each iteration.
+    pool = None
+    worker_chunks: list[list[InfoSet]] = []
+    if solver_cfg.n_workers > 1:
+        pool = mp.get_context("spawn").Pool(
+            solver_cfg.n_workers, initializer=_init_worker, initargs=(cfg, table)
+        )
+        # Cost-balanced, computed once (info-set costs are static across sweeps).
+        worker_chunks = _balanced_chunks(
+            infosets, len(cfg.seats), solver_cfg.n_workers,
+            solver_cfg.mc_iterations, solver_cfg.mc_iterations_deep,
+            solver_cfg.deep_opponent_threshold,
+        )
+
     max_delta = float("inf")
     iteration = start_iter - 1
-    for iteration in range(start_iter, solver_cfg.max_iterations + 1):
-        alpha_t = _alpha_at(solver_cfg, iteration)
+    try:
+        for iteration in range(start_iter, solver_cfg.max_iterations + 1):
+            alpha_t = _alpha_at(solver_cfg, iteration)
 
-        new_ranges: RangeMap = {}
-        max_delta = 0.0
-        for infoset, key in zip(infosets, keys):
-            br = best_response(
-                cfg, infoset, ranges, table, evaluator=evaluator,
-                mc_iterations=solver_cfg.mc_iterations,
-            )
-            updated = damped_update(ranges[key], br, alpha_t)
-            new_ranges[key] = updated
-            max_delta = max(max_delta, float(np.abs(updated - ranges[key]).max()))
-        ranges = new_ranges
-
-        if solver_cfg.return_averaged and iteration > burn_in_iter:
-            for key in keys:
-                range_sum[key] += ranges[key]
-            avg_count += 1
-
-        # Deterministic-HU early stop: only meaningful when NOT averaging (the noisy
-        # 4-max solve never gates on the per-sweep exploitability -- see docstring).
-        if not solver_cfg.return_averaged and max_delta < solver_cfg.epsilon:
-            expl = compute_exploitability(
-                cfg, ranges, table, infosets, evaluator=evaluator,
-                mc_iterations=solver_cfg.mc_iterations,
-            )
-            if expl < solver_cfg.exploitability_epsilon:
-                break
-
-        if solver_cfg.log_every and iteration % solver_cfg.log_every == 0:
-            if avg_count > 0:
-                cur_avg = {k: range_sum[k] / avg_count for k in keys}
-                if prev_avg is not None:
-                    avg_range_drift = max(
-                        float(np.abs(cur_avg[k] - prev_avg[k]).max()) for k in keys
+            # Every info set's best response against the frozen `ranges` snapshot --
+            # serially (one process, the exact original path, with a fresh per-sweep
+            # multiway-equity memo) or fanned out across worker processes.
+            if pool is None:
+                mc_cache: dict = {}
+                brs: RangeMap = {
+                    key: best_response(
+                        cfg, infoset, ranges, table, evaluator=evaluator,
+                        mc_iterations=solver_cfg.mc_iterations, mc_cache=mc_cache,
+                        mc_iterations_deep=solver_cfg.mc_iterations_deep,
+                        deep_threshold=solver_cfg.deep_opponent_threshold,
                     )
-                prev_avg = cur_avg
-            logger.info("iter=%d alpha=%.5f max_delta=%.2e avg_drift=%.2e",
-                        iteration, alpha_t, max_delta, avg_range_drift)
+                    for infoset, key in zip(infosets, keys)
+                }
+            else:
+                tasks = [
+                    (chunk, ranges, solver_cfg.mc_iterations, solver_cfg.mc_iterations_deep,
+                     solver_cfg.deep_opponent_threshold, iteration * 100003 + w)
+                    for w, chunk in enumerate(worker_chunks)
+                ]
+                brs = {}
+                for chunk_out in pool.starmap(_best_response_chunk, tasks):
+                    brs.update(dict(chunk_out))
 
-        if solver_cfg.checkpoint_path is not None and iteration % solver_cfg.checkpoint_every == 0:
-            _save_checkpoint(solver_cfg.checkpoint_path, {
-                "ranges": ranges, "range_sum": range_sum,
-                "avg_count": avg_count, "iteration": iteration,
-            })
+            new_ranges: RangeMap = {}
+            max_delta = 0.0
+            for key in keys:
+                updated = damped_update(ranges[key], brs[key], alpha_t)
+                new_ranges[key] = updated
+                max_delta = max(max_delta, float(np.abs(updated - ranges[key]).max()))
+            ranges = new_ranges
+
+            if solver_cfg.return_averaged and iteration > burn_in_iter:
+                for key in keys:
+                    range_sum[key] += ranges[key]
+                avg_count += 1
+
+            # Deterministic-HU early stop: only meaningful when NOT averaging (the noisy
+            # 4-max/9-max solve never gates on the per-sweep exploitability -- see docstring).
+            if not solver_cfg.return_averaged and max_delta < solver_cfg.epsilon:
+                expl = compute_exploitability(
+                    cfg, ranges, table, infosets, evaluator=evaluator,
+                    mc_iterations=solver_cfg.mc_iterations,
+                    mc_iterations_deep=solver_cfg.mc_iterations_deep,
+                    deep_threshold=solver_cfg.deep_opponent_threshold,
+                )
+                if expl < solver_cfg.exploitability_epsilon:
+                    break
+
+            if solver_cfg.log_every and iteration % solver_cfg.log_every == 0:
+                if avg_count > 0:
+                    cur_avg = {k: range_sum[k] / avg_count for k in keys}
+                    if prev_avg is not None:
+                        avg_range_drift = max(
+                            float(np.abs(cur_avg[k] - prev_avg[k]).max()) for k in keys
+                        )
+                    prev_avg = cur_avg
+                logger.info("iter=%d alpha=%.5f max_delta=%.2e avg_drift=%.2e",
+                            iteration, alpha_t, max_delta, avg_range_drift)
+
+            if solver_cfg.checkpoint_path is not None and iteration % solver_cfg.checkpoint_every == 0:
+                _save_checkpoint(solver_cfg.checkpoint_path, {
+                    "ranges": ranges, "range_sum": range_sum,
+                    "avg_count": avg_count, "iteration": iteration,
+                })
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     # The returned estimate: the tail average (Polyak-Ruppert) if enabled, else the
     # final iterate. Averaging is the correct estimator under MC noise -- see docstring.
@@ -351,10 +519,14 @@ def solve(
     # trustworthy point estimate. For deterministic HU both reads are identical/exact.
     hi_mc = solver_cfg.final_exploitability_mc
     exploitability_hi_mc = compute_exploitability(
-        cfg, ranges, table, infosets, evaluator=evaluator, mc_iterations=hi_mc,
+        cfg, ranges, table, infosets, evaluator=evaluator, mc_iterations=hi_mc, mc_cache={},
+        mc_iterations_deep=solver_cfg.mc_iterations_deep,
+        deep_threshold=solver_cfg.deep_opponent_threshold,
     )
     exploitability_hi_mc_2x = compute_exploitability(
-        cfg, ranges, table, infosets, evaluator=evaluator, mc_iterations=2 * hi_mc,
+        cfg, ranges, table, infosets, evaluator=evaluator, mc_iterations=2 * hi_mc, mc_cache={},
+        mc_iterations_deep=solver_cfg.mc_iterations_deep,
+        deep_threshold=solver_cfg.deep_opponent_threshold,
     )
 
     info = {

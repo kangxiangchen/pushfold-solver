@@ -35,7 +35,11 @@ from tree import InfoSet, RangeMap
 
 
 def settle(
-    cfg: GameConfig, contributions: dict[str, float], equities: dict[str, float]
+    cfg: GameConfig,
+    contributions: dict[str, float],
+    equities: dict[str, float],
+    *,
+    contested: bool | None = None,
 ) -> dict[str, dict[str, float]]:
     """General terminal settlement.
 
@@ -48,21 +52,29 @@ def settle(
     equities[seat]: this seat's equity share of the award, in [0, 1], summing to 1.0
         across all seats present (0 implicitly for any seat not in this dict, i.e. a
         pure folder who isn't contesting anything).
+    contested: whether this pot reached an all-in showdown (2+ seats contesting), which
+        matters only under a rake model that skips uncontested pots (cfg.rake_uncontested
+        False). Inferred from `len(equities) >= 2` when not given -- a walk/steal has a
+        single 1.0-equity winner, a showdown has 2+ equity entries.
 
-    ledger_net_i = equities.get(i, 0) * (P - drop_bb) - contributions[i]  for every
-    seat i in `contributions`. This single line already reproduces: a showdown
-    participant (contribution=stack_bb, equity=their real equity share); a folder
-    (contribution=blind_bb, equity=0, so ledger_net = -blind_bb exactly); and an
-    uncontested winner (contribution=0, equity=1.0, so ledger_net = P - drop_bb,
-    i.e. exactly the spec's "D - drop" steal/walk formula, since P = D when nobody
-    else has a live contribution).
+    ledger_net_i = equities.get(i, 0) * (P - drop) - contributions[i]  for every
+    seat i in `contributions`, where drop = cfg.drop_for_pot(P, contested). This single
+    line already reproduces: a showdown participant (contribution=stack_bb, equity=their
+    real equity share); a folder (contribution=blind_bb, equity=0, so ledger_net =
+    -blind_bb exactly); and an uncontested winner (contribution=0, equity=1.0, so
+    ledger_net = P - drop, i.e. exactly the spec's "D - drop" steal/walk formula, since
+    P = D when nobody else has a live contribution).
     """
     total_pot = sum(contributions.values())
+    if contested is None:
+        contested = len(equities) >= 2
+    drop = cfg.drop_for_pot(total_pot, contested=contested)
+    rakeback_pool = cfg.rakeback_pool_for_pot(total_pot, contested=contested)
     result: dict[str, dict[str, float]] = {}
     for seat, contribution in contributions.items():
-        award = equities.get(seat, 0.0) * (total_pot - cfg.drop_bb)
+        award = equities.get(seat, 0.0) * (total_pot - drop)
         ledger_net = award - contribution
-        rakeback = cfg.rakeback_pool_bb * (contribution / total_pot) if total_pot > 0 else 0.0
+        rakeback = rakeback_pool * (contribution / total_pot) if total_pot > 0 else 0.0
         result[seat] = {
             "ledger_net": ledger_net,
             "rakeback": rakeback,
@@ -197,8 +209,10 @@ def fold_baseline_ev_net(cfg: GameConfig, infoset: InfoSet, ranges: RangeMap) ->
         # Edge case (2): a real multiway pot (stacks actually committed) only exists
         # once 2+ OTHER seats are simultaneously live; 0 or 1 live others means
         # whoever's left (if anyone) also won uncontested, so no stack is added.
-        total_pot = dead_money + (num_live_others * cfg.stack_bb if num_live_others >= 2 else 0.0)
-        rakeback = cfg.rakeback_pool_bb * (this_blind / total_pot) if total_pot > 0 else 0.0
+        contested = num_live_others >= 2
+        total_pot = dead_money + (num_live_others * cfg.stack_bb if contested else 0.0)
+        rakeback_pool = cfg.rakeback_pool_for_pot(total_pot, contested=contested)
+        rakeback = rakeback_pool * (this_blind / total_pot) if total_pot > 0 else 0.0
         ev_total += prob * (-this_blind + rakeback)
     return ev_total
 
@@ -212,19 +226,23 @@ def showdown_ev_net_vec(
     hero hands at once, given their equity against the joint opponent distribution
     (`eq_vector`) and any already-dead money from earlier folds. `num_opponents=1`
     (the default) reproduces the original heads-up-only formula exactly, so every
-    existing caller is unaffected by this generalization."""
+    existing caller is unaffected by this generalization. A showdown is always a
+    contested pot (hero plus at least one live opponent), so it is always raked."""
     total_pot = (1 + num_opponents) * cfg.stack_bb + dead_money_bb
-    award = eq_vector * (total_pot - cfg.drop_bb)
+    drop = cfg.drop_for_pot(total_pot, contested=True)
+    award = eq_vector * (total_pot - drop)
     ledger_net = award - cfg.stack_bb
-    rakeback = cfg.rakeback_pool_bb * (cfg.stack_bb / total_pot)
+    rakeback = cfg.rakeback_pool_for_pot(total_pot, contested=True) * (cfg.stack_bb / total_pot)
     return ledger_net + rakeback
 
 
 def steal_ev_net(cfg: GameConfig, total_dead_money_bb: float) -> float:
     """EV-net of winning uncontested (everyone else folds) -- a scalar, since it
     doesn't depend on the winner's specific hand. No rakeback term: the winner's own
-    bet was never called, so their contribution to the formed pot is 0."""
-    return total_dead_money_bb - cfg.drop_bb
+    bet was never called, so their contribution to the formed pot is 0. Whether the
+    uncontested pot is raked at all depends on cfg.rake_uncontested (the flat CoinPoker
+    model rakes steals; a "no showdown, no drop" game leaves them untouched)."""
+    return total_dead_money_bb - cfg.drop_for_pot(total_dead_money_bb, contested=False)
 
 
 def shove_ev_net_vec(
@@ -235,6 +253,9 @@ def shove_ev_net_vec(
     evaluator: equity.Evaluator | None = None,
     mc_iterations: int = 200,
     rng: np.random.Generator | None = None,
+    mc_cache: dict | None = None,
+    mc_iterations_deep: int | None = None,
+    deep_threshold: int = 4,
 ) -> np.ndarray:
     """EV-net of SHOVING, for every one of the 169 hero hands, at ANY info set --
     this single function replaces the old HU-only open_shove_ev_net_vec (exactly one
@@ -259,6 +280,26 @@ def shove_ev_net_vec(
     open_shove_ev_net_vec's blend termwise. BB's call has zero seats after it,
     producing exactly 1 trivial leaf with 1 live opponent (SB), reducing to the old
     call_ev_net_vec's pure showdown-vs-range computation.
+
+    `mc_cache`, when supplied, memoizes multiway_equity_mc results within a single
+    sweep (ranges are frozen during a sweep, so any two leaves -- here or at another
+    info set -- facing the same multiset of opponent ranges have identical MC inputs
+    and identical hero equity, since hero's seat/dead money are applied only afterwards
+    in showdown_ev_net_vec). Keyed by the opponent ranges' exact contents, so it is
+    exact, not an approximation. It helps most when opponent range-sets recur (e.g. the
+    all-identical cold start); once ranges specialize it hits rarely, so it is a minor
+    lever, not the main one (that's parallelism + `mc_iterations_deep`, below). Leaving
+    it None (as every existing caller/test does) disables caching and reproduces today's
+    behavior bit-for-bit. The caller must pass a FRESH dict each sweep so stale ranges
+    are never reused.
+
+    `mc_iterations_deep`, when set, caps the MC samples for DEEP pots (>= deep_threshold
+    live opponents) at that smaller count instead of `mc_iterations`. Deep multiway
+    all-ins are both the most expensive equity to sample (more opponents per iteration)
+    and, at these tight 5bb ranges, vanishingly rare -- so their probability weight in
+    the shove EV is tiny and a coarse equity for them barely moves the answer, while
+    cutting the dominant cost of a 9-max sweep. Left None (every existing caller/test)
+    uses `mc_iterations` for every pot -- today's behavior exactly.
     """
     total = np.zeros(cards.NUM_CANON_HANDS)
     for prob, live_opponents, folded_after, opp_ranges in _enumerate_realization_leaves(
@@ -279,9 +320,24 @@ def shove_ev_net_vec(
                     f"{tree.infoset_key(infoset.seat, infoset.shoved_before)} needs multiway "
                     f"equity ({num_opponents} live opponents) but no evaluator was supplied"
                 )
-            eq_vec = equity.multiway_equity_mc(
-                list(opp_ranges.values()), evaluator, mc_iterations, rng=rng
+            opp_arrays = list(opp_ranges.values())
+            iters = (
+                mc_iterations_deep
+                if (mc_iterations_deep is not None and num_opponents >= deep_threshold)
+                else mc_iterations
             )
+            # Cache key includes `iters`: the same opponent set sampled at two different
+            # precisions is two different results, so they must not alias.
+            cache_key = (
+                (tuple(sorted(r.tobytes() for r in opp_arrays)), iters)
+                if mc_cache is not None else None
+            )
+            if cache_key is not None and cache_key in mc_cache:
+                eq_vec = mc_cache[cache_key]
+            else:
+                eq_vec = equity.multiway_equity_mc(opp_arrays, evaluator, iters, rng=rng)
+                if cache_key is not None:
+                    mc_cache[cache_key] = eq_vec
             leaf_ev = showdown_ev_net_vec(cfg, dead_money, eq_vec, num_opponents=num_opponents)
 
         total = total + prob * leaf_ev
