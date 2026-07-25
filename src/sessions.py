@@ -24,7 +24,6 @@ from __future__ import annotations
 import csv
 import json
 import math
-import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -40,16 +39,24 @@ class OpenSessionExistsError(RuntimeError):
 class Session:
     start_time: str  # "YYYY/MM/DD HH:MM:SS", same format as hand-history headers
     end_time: str
-    start_balance: float
-    end_balance: float
-    rakeback_balance_start: float
-    rakeback_balance_end: float
+    # Main balances are OPTIONAL (both-or-neither): a session logged from a
+    # hand-history upload can source its table result from hh_table_result instead.
+    # When both sources exist, balances win (they capture postflop-excluded net too)
+    # and the HH number becomes the cross-check.
+    start_balance: float | None = None
+    end_balance: float | None = None
+    # Rakeback balances are OPTIONAL (both-or-neither): skipping them loses the
+    # table/rakeback split and the rho estimate for this session, nothing else.
+    rakeback_balance_start: float | None = None
+    rakeback_balance_end: float | None = None
     rakeback_claimed: float = 0.0  # rakeback moved into the main balance mid-session
     deposits: float = 0.0
     withdrawals: float = 0.0
     rake_paid_start: float | None = None  # mission/leaderboard "rake paid" counter
     rake_paid_end: float | None = None
     hands_played: int | None = None  # manual estimate; HH join supersedes it
+    hh_table_result: float | None = None  # sum of hero_net_currency over the session's
+    # hands, stored at logging time so the ledger stands alone without the export
     stakes_note: str = ""  # human reference only (e.g. "1/2 + 2/5"), never used for math
     notes: str = ""
 
@@ -68,10 +75,20 @@ class Session:
             "withdrawals": self.withdrawals,
         }
         for name, value in non_negative.items():
-            if not math.isfinite(value) or value < 0:
+            if value is not None and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"{name} must be finite and non-negative, got {value}")
-        if (self.rake_paid_start is None) != (self.rake_paid_end is None):
-            raise ValueError("rake_paid_start and rake_paid_end must be recorded together or not at all")
+        for a, b in (("start_balance", "end_balance"),
+                     ("rakeback_balance_start", "rakeback_balance_end"),
+                     ("rake_paid_start", "rake_paid_end")):
+            if (getattr(self, a) is None) != (getattr(self, b) is None):
+                raise ValueError(f"{a} and {b} must be recorded together or not at all")
+        if self.start_balance is None and self.hh_table_result is None:
+            raise ValueError(
+                "a session needs a table-result source: either both main balances "
+                "or hh_table_result (from a hand-history join)"
+            )
+        if self.hh_table_result is not None and not math.isfinite(self.hh_table_result):
+            raise ValueError(f"hh_table_result must be finite, got {self.hh_table_result}")
         if self.rake_paid_start is not None and self.rake_paid_end < self.rake_paid_start:
             raise ValueError(
                 f"rake_paid counter cannot decrease ({self.rake_paid_start} -> {self.rake_paid_end})"
@@ -81,31 +98,44 @@ class Session:
 
 
 def table_result(s: Session) -> float:
-    """What the tables actually paid/cost this session, with the three non-table
-    balance movements (claims, deposits, withdrawals) stripped back out."""
-    return s.end_balance - s.start_balance - s.rakeback_claimed - s.deposits + s.withdrawals
+    """What the tables actually paid/cost this session. Balance-derived when balance
+    readings exist (they also capture postflop-excluded net, and the three non-table
+    movements are stripped back out); else the stored hand-history-derived net.
+    Validation guarantees at least one source exists."""
+    if s.start_balance is not None:
+        return s.end_balance - s.start_balance - s.rakeback_claimed - s.deposits + s.withdrawals
+    return s.hh_table_result
 
 
-def rakeback_earned(s: Session) -> float:
+def rakeback_earned(s: Session) -> float | None:
     """Rakeback accrued during the session, whether or not it was claimed: the
-    claimable balance's delta plus whatever was moved out of it mid-session."""
+    claimable balance's delta plus whatever was moved out of it mid-session.
+    None when the rakeback balance wasn't recorded for this session."""
+    if s.rakeback_balance_start is None:
+        return None
     return s.rakeback_balance_end - s.rakeback_balance_start + s.rakeback_claimed
 
 
 def total_result(s: Session) -> float:
-    return table_result(s) + rakeback_earned(s)
+    """Table plus rakeback; a session without rakeback readings contributes its
+    table result alone (the rakeback it earned is simply unmeasured, not zero --
+    summarize() reports how many sessions are in that state)."""
+    rakeback = rakeback_earned(s)
+    return table_result(s) + (rakeback if rakeback is not None else 0.0)
 
 
 def effective_rakeback_rate(s: Session) -> float | None:
     """rho = rakeback earned per unit of rake attributed by the client's own
-    counter -- the number the solver's fee model needs. None when the counter
-    wasn't recorded or didn't move (an all-fold session can legitimately not move it)."""
-    if s.rake_paid_start is None or s.rake_paid_end is None:
+    counter -- the number the solver's fee model needs. None when the counter or
+    the rakeback balance wasn't recorded, or the counter didn't move (an all-fold
+    session can legitimately not move it)."""
+    rakeback = rakeback_earned(s)
+    if rakeback is None or s.rake_paid_start is None or s.rake_paid_end is None:
         return None
     delta = s.rake_paid_end - s.rake_paid_start
     if delta <= 0:
         return None
-    return rakeback_earned(s) / delta
+    return rakeback / delta
 
 
 # ---------------------------------------------------------------------------------
@@ -129,32 +159,33 @@ def append_session(path: str, session: Session) -> None:
 
 
 def _session_from_row(row: dict) -> Session:
+    """Build a Session from a dict of raw values (CSV strings, or the JSON types the
+    logging server receives -- floats/None pass through unchanged)."""
     def opt_float(name: str) -> float | None:
         raw = row.get(name)
         return float(raw) if raw not in (None, "") else None
 
-    def req_float(name: str) -> float:
+    def def_float(name: str, default: float) -> float:
         raw = row.get(name)
-        if raw in (None, ""):
-            raise ValueError(f"missing required field {name!r}")
-        return float(raw)
+        return float(raw) if raw not in (None, "") else default
 
     hands_raw = row.get("hands_played")
     return Session(
         start_time=row.get("start_time") or "",
         end_time=row.get("end_time") or "",
-        start_balance=req_float("start_balance"),
-        end_balance=req_float("end_balance"),
-        rakeback_balance_start=req_float("rakeback_balance_start"),
-        rakeback_balance_end=req_float("rakeback_balance_end"),
-        rakeback_claimed=req_float("rakeback_claimed"),
-        deposits=req_float("deposits"),
-        withdrawals=req_float("withdrawals"),
+        start_balance=opt_float("start_balance"),
+        end_balance=opt_float("end_balance"),
+        rakeback_balance_start=opt_float("rakeback_balance_start"),
+        rakeback_balance_end=opt_float("rakeback_balance_end"),
+        rakeback_claimed=def_float("rakeback_claimed", 0.0),
+        deposits=def_float("deposits", 0.0),
+        withdrawals=def_float("withdrawals", 0.0),
         rake_paid_start=opt_float("rake_paid_start"),
         rake_paid_end=opt_float("rake_paid_end"),
         hands_played=int(hands_raw) if hands_raw not in (None, "") else None,
-        stakes_note=row.get("stakes_note") or "",
-        notes=row.get("notes") or "",
+        hh_table_result=opt_float("hh_table_result"),
+        stakes_note=str(row.get("stakes_note") or ""),
+        notes=str(row.get("notes") or ""),
     )
 
 
@@ -208,12 +239,6 @@ def clear_open_session(path: str) -> None:
 # Hand-history join: the only source of per-stake stats.
 # ---------------------------------------------------------------------------------
 
-# Street banners with betting rounds. Runout-only all-ins in this data do NOT print
-# these (the board appears in the SUMMARY line instead -- verified against real
-# exports), so their presence means genuine postflop streets happened.
-_POSTFLOP_BANNER_RE = re.compile(r"^\*\*\* (?:FIRST |SECOND )?(?:FLOP|TURN|RIVER) \*\*\*", re.MULTILINE)
-
-
 def hands_in_window(hands: list[ParsedHand], start_time: str, end_time: str) -> list[ParsedHand]:
     """Hands whose header timestamp falls inside [start_time, end_time], inclusive."""
     start = parse_timestamp(start_time)
@@ -221,18 +246,53 @@ def hands_in_window(hands: list[ParsedHand], start_time: str, end_time: str) -> 
     return [h for h in hands if start <= parse_timestamp(h.timestamp) <= end]
 
 
-def hero_net_currency(hand: ParsedHand) -> float | None:
-    """Hero's net for one hand (collected minus total chips put in), in currency.
+@dataclass(frozen=True)
+class DetectedSession:
+    start_time: str  # first hand's timestamp, session-tracker format (no tz)
+    end_time: str  # last hand's timestamp
+    hands: tuple  # the ParsedHand slice, chronological
 
-    Exact for preflop-terminal hands (every hand in the all-in-or-fold formats):
-    blinds/antes posted, plus each voluntary action tracked at the level the parser
-    recorded, minus uncalled-bet returns. Returns None for hands with genuine
-    postflop betting streets -- the parser only captures preflop actions, so a net
-    for those would be silently wrong rather than approximately right.
+
+def detect_sessions(hands: list[ParsedHand], gap_minutes: float = 45.0) -> list[DetectedSession]:
+    """Cluster hands into sessions by inter-hand time gap: a gap >= gap_minutes starts
+    a new session. On the real data this is nearly unambiguous (13,105 of 13,132 gaps
+    are <5min and the next tier is hours; only 4 gaps fall in 20-90min over 5 months),
+    so the default threshold hardly matters -- it's a knob, not a tuning problem."""
+    if not hands:
+        return []
+    stamped = sorted(((parse_timestamp(h.timestamp), h) for h in hands), key=lambda p: p[0])
+    fmt = "%Y/%m/%d %H:%M:%S"
+
+    clusters: list[list] = [[stamped[0]]]
+    for prev, cur in zip(stamped, stamped[1:]):
+        if (cur[0] - prev[0]).total_seconds() >= gap_minutes * 60:
+            clusters.append([])
+        clusters[-1].append(cur)
+
+    return [
+        DetectedSession(
+            start_time=cluster[0][0].strftime(fmt),
+            end_time=cluster[-1][0].strftime(fmt),
+            hands=tuple(h for _, h in cluster),
+        )
+        for cluster in clusters
+    ]
+
+
+def hero_net_currency(hand: ParsedHand) -> float | None:
+    """Hero's net for one hand (collected minus total chips put in), in currency --
+    exact across ALL streets: blinds/antes posted, then each street's actions with
+    the bet level reset per street ("raises ... to X" is street-absolute), minus
+    uncalled-bet returns; collected sums every board of a run-it-twice hand.
+
+    Returns None only when HERO produced an action line the parser couldn't classify
+    (hand.unclassified_action_names) -- then hero's money movement is untrustworthy.
+    Villains' unparsed oddities don't matter: collected is ground truth and only
+    hero's own actions move hero's chips.
     """
-    if _POSTFLOP_BANNER_RE.search(hand.raw_text):
-        return None
     hero = hand.hero_name or "Hero"
+    if hero in hand.unclassified_action_names:
+        return None
     posted = 0.0
     if hero == hand.sb_poster:
         posted += hand.sb_amount
@@ -242,18 +302,20 @@ def hero_net_currency(hand: ParsedHand) -> float | None:
         posted += hand.ante_amount
 
     total_in = posted
-    level = posted  # hero's current committed bet level ("raises ... to X" is absolute)
-    for action in hand.preflop_actions:
-        if action.name != hero or action.to_amount is None:
-            continue
-        if action.action == "raises":
-            total_in += action.to_amount - level
-            level = action.to_amount
-        elif action.action in ("calls", "allin"):  # both are stated as additional chips
-            total_in += action.to_amount
-            level += action.to_amount
-        elif action.action == "return":
-            total_in -= action.to_amount
+    for street_idx, actions in enumerate([hand.preflop_actions, *hand.postflop_streets]):
+        # preflop level starts at hero's posted blinds; each later street starts at 0
+        level = posted if street_idx == 0 else 0.0
+        for action in actions:
+            if action.name != hero or action.to_amount is None:
+                continue
+            if action.action == "raises":
+                total_in += action.to_amount - level
+                level = action.to_amount
+            elif action.action in ("calls", "bets", "allin", "post"):  # additional chips
+                total_in += action.to_amount
+                level += action.to_amount
+            elif action.action == "return":
+                total_in -= action.to_amount
 
     return hand.collected_by.get(hero, 0.0) - total_in
 
@@ -308,18 +370,20 @@ def per_stake_stats(hands: list[ParsedHand]) -> dict[float, StakeStats]:
 class Summary:
     n_sessions: int
     total_table_result: float
-    total_rakeback_earned: float
+    total_rakeback_earned: float  # over sessions that recorded rakeback balances
     total_result: float
     mean_session_result: float | None  # total_result per session
     std_session_result: float | None  # sample std (ddof=1), needs >= 2 sessions
     rho_sessions: int  # sessions where the rake-paid counter allowed a rho estimate
     rho_mean: float | None
     rho_se: float | None  # standard error of the mean rho, needs >= 2 estimates
+    rakeback_missing: int  # sessions logged without rakeback balances (unmeasured, not 0)
 
 
 def summarize(sessions: list[Session]) -> Summary:
     n = len(sessions)
     results = [total_result(s) for s in sessions]
+    rakebacks = [rakeback_earned(s) for s in sessions]
     rhos = [r for r in (effective_rakeback_rate(s) for s in sessions) if r is not None]
 
     mean_result = sum(results) / n if n else None
@@ -336,11 +400,12 @@ def summarize(sessions: list[Session]) -> Summary:
     return Summary(
         n_sessions=n,
         total_table_result=sum(table_result(s) for s in sessions),
-        total_rakeback_earned=sum(rakeback_earned(s) for s in sessions),
+        total_rakeback_earned=sum(r for r in rakebacks if r is not None),
         total_result=sum(results),
         mean_session_result=mean_result,
         std_session_result=std_result,
         rho_sessions=len(rhos),
         rho_mean=rho_mean,
         rho_se=rho_se,
+        rakeback_missing=sum(1 for r in rakebacks if r is None),
     )

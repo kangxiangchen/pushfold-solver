@@ -90,6 +90,126 @@ def test_effective_rakeback_rate_none_when_counter_did_not_move():
 
 
 # ---------------------------------------------------------------------------------
+# HH-derived sessions (v2): balances optional, table result can come from the
+# hand-history join instead; rakeback tracking is optional per session.
+# ---------------------------------------------------------------------------------
+
+
+def test_hh_only_session_falls_back_to_hh_table_result():
+    s = sessions.Session(
+        start_time="2026/07/01 20:00:00",
+        end_time="2026/07/01 23:30:00",
+        hh_table_result=-12.5,
+    )
+    assert sessions.table_result(s) == pytest.approx(-12.5)
+    assert sessions.rakeback_earned(s) is None
+    assert sessions.total_result(s) == pytest.approx(-12.5)
+    assert sessions.effective_rakeback_rate(s) is None
+
+
+def test_balances_take_precedence_over_hh_table_result():
+    s = make_session(hh_table_result=-999.0)  # balances say +60; HH number is stale/partial
+    assert sessions.table_result(s) == pytest.approx(60.0)
+
+
+def test_session_requires_at_least_one_table_result_source():
+    with pytest.raises(ValueError):
+        sessions.Session(
+            start_time="2026/07/01 20:00:00",
+            end_time="2026/07/01 23:30:00",
+            rakeback_balance_start=10.0,
+            rakeback_balance_end=14.0,
+        )
+
+
+def test_main_balances_must_be_recorded_together_or_not_at_all():
+    with pytest.raises(ValueError):
+        sessions.Session(
+            start_time="2026/07/01 20:00:00", end_time="2026/07/01 21:00:00",
+            start_balance=500.0, hh_table_result=5.0,
+        )
+    with pytest.raises(ValueError):
+        sessions.Session(
+            start_time="2026/07/01 20:00:00", end_time="2026/07/01 21:00:00",
+            end_balance=500.0, hh_table_result=5.0,
+        )
+
+
+def test_rakeback_balances_must_be_recorded_together_or_not_at_all():
+    with pytest.raises(ValueError):
+        sessions.Session(
+            start_time="2026/07/01 20:00:00", end_time="2026/07/01 21:00:00",
+            hh_table_result=5.0, rakeback_balance_start=10.0,
+        )
+
+
+def test_hh_table_result_round_trips_through_csv(tmp_path):
+    path = str(tmp_path / "sessions.csv")
+    s = sessions.Session(
+        start_time="2026/07/01 20:00:00", end_time="2026/07/01 23:30:00",
+        hh_table_result=-12.5, hands_played=300,
+    )
+    sessions.append_session(path, s)
+    loaded, failures = sessions.load_sessions(path)
+    assert failures == []
+    assert loaded == [s]
+
+
+def test_summarize_counts_sessions_missing_rakeback_and_treats_none_as_zero():
+    s1 = make_session()  # table +60, rakeback +4
+    s2 = sessions.Session(
+        start_time="2026/07/02 20:00:00", end_time="2026/07/02 21:00:00",
+        hh_table_result=-10.0,
+    )
+    summary = sessions.summarize([s1, s2])
+    assert summary.total_table_result == pytest.approx(50.0)
+    assert summary.total_rakeback_earned == pytest.approx(4.0)
+    assert summary.total_result == pytest.approx(54.0)
+    assert summary.rakeback_missing == 1
+
+
+# ---------------------------------------------------------------------------------
+# Session auto-detection from hand timestamps (gap clustering).
+# ---------------------------------------------------------------------------------
+
+
+def test_detect_sessions_clusters_by_gap():
+    hands = [
+        make_hand("2026/07/01 20:00:00", 2.0, 0.0),
+        make_hand("2026/07/01 20:05:00", 2.0, 0.0),
+        make_hand("2026/07/01 20:10:00", 2.0, 0.0),
+        make_hand("2026/07/01 22:00:00", 2.0, 0.0),  # 110min gap -> new session
+        make_hand("2026/07/01 22:03:00", 2.0, 0.0),
+    ]
+    detected = sessions.detect_sessions(hands, gap_minutes=45)
+    assert len(detected) == 2
+    assert detected[0].start_time == "2026/07/01 20:00:00"
+    assert detected[0].end_time == "2026/07/01 20:10:00"
+    assert len(detected[0].hands) == 3
+    assert detected[1].start_time == "2026/07/01 22:00:00"
+    assert len(detected[1].hands) == 2
+
+
+def test_detect_sessions_gap_exactly_at_threshold_starts_new_session():
+    hands = [
+        make_hand("2026/07/01 20:00:00", 2.0, 0.0),
+        make_hand("2026/07/01 20:45:00", 2.0, 0.0),
+    ]
+    assert len(sessions.detect_sessions(hands, gap_minutes=45)) == 2
+    assert len(sessions.detect_sessions(hands, gap_minutes=46)) == 1
+
+
+def test_detect_sessions_unsorted_input_and_empty():
+    assert sessions.detect_sessions([], gap_minutes=45) == []
+    hands = [
+        make_hand("2026/07/01 22:00:00", 2.0, 0.0),
+        make_hand("2026/07/01 20:00:00", 2.0, 0.0),
+    ]
+    detected = sessions.detect_sessions(hands, gap_minutes=45)
+    assert [d.start_time for d in detected] == ["2026/07/01 20:00:00", "2026/07/01 22:00:00"]
+
+
+# ---------------------------------------------------------------------------------
 # Validation at the boundary.
 # ---------------------------------------------------------------------------------
 
@@ -249,11 +369,30 @@ def test_hero_net_lost_showdown_is_negative_stack():
     assert sessions.hero_net_currency(hand) == pytest.approx(-16.0)
 
 
-def test_hero_net_none_when_postflop_betting_present():
-    hand = make_hand("2026/07/01 20:04:00", 2.0, 5.0, hero_is="BB")
-    hand = hand_history.ParsedHand(**{**hand.__dict__, "raw_text":
-        "*** FLOP *** [Ah 7d 2c]\nvillain: bets 4\nHero: calls 4\n"})
-    assert sessions.hero_net_currency(hand) is None
+def test_hero_net_exact_across_postflop_streets():
+    # Hero posts BB 2, checks preflop; bets 4 on the flop (called); raises to 12 on
+    # the turn ("raises X to Y" is street-absolute, so the increment is 12), villain
+    # folds, 8 returned uncalled. Total in = 2 + 4 + 12 - 8 = 10; collected 15.56.
+    hand = make_hand("2026/07/01 20:04:00", 2.0, 15.56, hero_is="BB")
+    postflop = [
+        [hand_history.PreflopAction("Hero", "bets", 4.0),
+         hand_history.PreflopAction("villain", "calls", 4.0)],
+        [hand_history.PreflopAction("villain", "bets", 4.0),
+         hand_history.PreflopAction("Hero", "raises", 12.0),
+         hand_history.PreflopAction("villain", "folds", None),
+         hand_history.PreflopAction("Hero", "return", 8.0)],
+    ]
+    hand = hand_history.ParsedHand(**{**hand.__dict__, "postflop_streets": postflop})
+    assert sessions.hero_net_currency(hand) == pytest.approx(15.56 - 10.0)
+
+
+def test_hero_net_none_only_when_hero_had_unclassified_actions():
+    hand = make_hand("2026/07/01 20:04:00", 2.0, 1.56, hero_is="BB", returns=(1.0,))
+    hero_junk = hand_history.ParsedHand(**{**hand.__dict__, "unclassified_action_names": ["Hero"]})
+    villain_junk = hand_history.ParsedHand(**{**hand.__dict__, "unclassified_action_names": ["villain"]})
+    assert sessions.hero_net_currency(hero_junk) is None
+    # villain-only oddities can't move hero's own money -- net stays computable
+    assert sessions.hero_net_currency(villain_junk) == pytest.approx(0.56)
 
 
 def test_per_stake_stats_groups_overlapping_multitabled_hands():
