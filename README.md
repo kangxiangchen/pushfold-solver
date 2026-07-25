@@ -184,24 +184,85 @@ full reasoning:
 ## Session tracking
 
 ```
-python scripts/session.py start          # stage a live session (prompts for the client's numbers)
-python scripts/session.py end            # complete it (prompts again, appends to data/sessions.csv)
-python scripts/session.py add ...        # record a finished session non-interactively (see --help)
-python scripts/session.py report --curve --hand-history data/export.txt
+python scripts/session_server.py         # then open http://127.0.0.1:8765 and log from the page
+```
+
+The server serves the visual dashboard (stat tiles, bankroll curve, sessions table,
+per-stake breakdown) with an in-page **Log a session** form. It scans `data/*.txt`
+hand-history exports (drag a new one onto the page to add it), clusters hands into
+sessions by time gap, hides the ones already logged, and proposes the rest with
+start/end times, hands, stakes, and the HH-derived table result prefilled. The only
+numbers that must be typed are the ones the export can't contain (they exist only in
+the client UI): the **claimable rakeback balance** at start/end (recommended — it powers
+the table/rakeback split), the mission/leaderboard **"rake paid" counter** at start/end
+(optional — yields the per-session **effective rakeback rate ρ**, the empirical input
+the fee model needs), and optionally the main balance readings (enables a cross-check
+of the HH-derived result and captures postflop-excluded net). Localhost-only, stdlib —
+never bind it to a public interface.
+
+Terminal alternatives (same CSV, same math):
+
+```
+python scripts/session.py start|end|add|report   # prompt-driven CLI logging + text report
+python scripts/export_session_viewer.py          # static read-only dashboard (cache/session_viewer.html)
 ```
 
 Sessions are **account-level** records (multitabling mixes 2-3 stakes, so a balance delta
-can't be attributed per stake): main balance + the separate claimable rakeback balance at
-both boundaries, plus any mid-session claims/deposits/withdrawals. That split is what
-separates `table_result` from `rakeback_earned` — a bare balance delta conflates them the
-moment rakeback is claimed. Optionally record the client's mission/leaderboard "rake paid"
-counter at both ends: each such session then yields an estimate of the **effective rakeback
-rate ρ** (rakeback earned per unit of attributed rake), the empirical input the fee model
-needs. Per-stake stats (hands, net, bb/100) come exclusively from `--hand-history`, which
-joins each session's time window against the export, grouped by stake; the report also
-cross-checks the balance-derived table result against the HH-derived net (a data-entry and
-export-coverage check). The ledger lives in `data/sessions.csv` (gitignored — personal
-financial data); see `src/sessions.py` for the accounting identities.
+can't be attributed per stake). Session-level truth comes from balance readings and/or the
+HH-derived net; per-stake stats (hands, net, bb/100) come exclusively from the hand-history
+join, grouped by stake. The ledger lives in `data/sessions.csv` (gitignored — personal
+financial data); see `src/sessions.py` for the accounting identities and exactly which
+fields are auto-derived vs manual.
+
+### Per-session GTO grade & luck cards
+
+When the solver artifacts exist under `cache/` (the equity table, plus optionally the
+4-max ranges pickle), the dashboard adds a **Push/fold analysis** card per session:
+
+- **Grade** — how many genuine push/fold spots the session's hands contained, the %
+  matching the solved equilibrium (a decision the equilibrium itself mixes counts as a
+  match either way), the total EV lost in currency, and the costliest individual
+  deviations (hand, position, hero action vs GTO action with its weight, loss in bb).
+- **Luck check** — over the graded spots (HU and 4-max alike), the model's predicted EV
+  of the decisions Hero *actually took* vs a realized EV built from each hand's true
+  outcome: the exact ledger net (`sessions.hero_net_currency`) plus the model-convention
+  rakeback of the leaf that realized (`session_analysis.realized_spot_ev_net_bb`). The
+  gap is variance: it says how much of the session's result was run-good/run-bad rather
+  than decision quality. A 4-max spot only joins the luck sums when the whole hand
+  resolved as pure shove-or-fold (villains limping behind Hero's fold has no model
+  leaf); it always keeps its grade. Ungraded hands (walks, limps, non-push/fold, deep
+  stacks) are shown as realized-only — they have no model EV at all.
+
+Grading is incremental: results persist per export under `cache/session_grades/` keyed
+by file mtime, so only new/changed exports are ever regraded (the server also warms this
+cache once at startup). All logic lives in `src/session_analysis.py`; pass `--no-grade`
+to either script to skip the cards. Nothing on a dashboard path ever *solves* — missing
+artifacts just degrade to fewer cards (see `session_analysis.make_grading_context`).
+
+### Population vs GTO + exploit charts
+
+The dashboard also carries a **Population vs GTO** card (`src/population.py`): every
+*villain* shove/fold decision across every scanned export, per info set, with pool
+frequency ± SE against the solved chart's own frequency (per-stake dropdown, z-scores
+flagged at |z| ≥ 2). Villain IDs rotate every hand on CoinPoker, so this is
+population-level by construction — per-player reads are impossible. A companion
+**shown-down composition** table checks *which* hands the pool's revealed shoves
+actually were vs the GTO range (`ParsedHand.shown_cards`; biased sample — cards appear
+only at showdowns). The census is recomputed per page load (~35ms), never cached.
+
+The measured pool feeds **exploit charts**:
+
+```
+venv/bin/python scripts/export_exploit_viewer.py --mc 8000 --seed 7   # cache/exploit_viewer.html
+```
+
+builds pool ranges from the observed frequencies (top-of-range assumption — stated on
+the page, empirically checked by the shown-down composition), computes hero's best
+response at all 14 info sets against that pool (`src/exploit.py`, one seeded MC draw
+per info set so the range and its EV-gain number are mutually consistent and reruns
+are reproducible), and renders GTO vs exploit range grids side by side with the
+per-opportunity EV gain. CLI-only: it needs the 7-card evaluator and never runs behind
+a page load; it also never solves — the ranges pickle and equity table must exist.
 
 ## Layout
 
