@@ -89,19 +89,36 @@ def grade_spot_against(
     table: np.ndarray,
     evaluator=None,
     model: str = "HU",
+    ev_memo: dict | None = None,
 ) -> GradedSpot:
     """Config-agnostic grading: works for any GameConfig/RangeMap pair, HU's 2 info
     sets or 4-max's 14 alike, since ev.shove_ev_net_vec/fold_baseline_ev_net are
     themselves already fully general (see ev.py's module docstring) -- there's no
     more "SB vs BB" branching needed, just a lookup of spot.info_set_key's InfoSet.
     `evaluator` is required only if grading ever hits a 2+-live-opponent leaf (i.e.
-    4-max multiway); HU spots never need it."""
+    4-max multiway); HU spots never need it.
+
+    `ev_memo` (optional, caller-owned dict) caches the (ev_go vector, ev_fold) pair
+    per (model, stack depth, info set) -- neither depends on hero's hand, so grading
+    thousands of spots against the same ranges costs at most one vector computation
+    per info set instead of one per spot. That's what makes bulk 4-max grading
+    tractable: each multiway shove_ev_net_vec is a Monte Carlo evaluation, minutes
+    across a big export when recomputed per spot, seconds when memoized. Sharing one
+    MC draw per info set also makes grades within a run consistent with each other."""
     hero_label = cards.hero_canon_label(*spot.hero_hand)
     hero_idx = cards.canon_index(hero_label)
-    infoset = tree.infosets_by_key(tree.build_infosets(cfg))[spot.info_set_key]
 
-    ev_go = float(ev.shove_ev_net_vec(cfg, infoset, ranges, table, evaluator=evaluator)[hero_idx])
-    ev_fold = ev.fold_baseline_ev_net(cfg, infoset, ranges)
+    memo_key = (model, cfg.stack_bb, spot.info_set_key)
+    if ev_memo is not None and memo_key in ev_memo:
+        ev_go_vec, ev_fold = ev_memo[memo_key]
+    else:
+        infoset = tree.infosets_by_key(tree.build_infosets(cfg))[spot.info_set_key]
+        ev_go_vec = ev.shove_ev_net_vec(cfg, infoset, ranges, table, evaluator=evaluator)
+        ev_fold = ev.fold_baseline_ev_net(cfg, infoset, ranges)
+        if ev_memo is not None:
+            ev_memo[memo_key] = (ev_go_vec, ev_fold)
+
+    ev_go = float(ev_go_vec[hero_idx])
     gto_weight = float(ranges[spot.info_set_key][hero_idx])
     position = spot.info_set_key.split("|", 1)[0]
 

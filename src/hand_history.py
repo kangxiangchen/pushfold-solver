@@ -55,8 +55,27 @@ ALLIN_RE = re.compile(r"^(?P<name>.+?): ALLIN (?P<amt_raw>.+)$")
 RAISE_RE = re.compile(r"^(?P<name>.+?): raises (?P<by_raw>.+) to (?P<to_raw>.+)$")
 CALL_RE = re.compile(r"^(?P<name>.+?): calls (?P<amt_raw>.+)$")
 BET_RE = re.compile(r"^(?P<name>.+?): bets (?P<amt_raw>.+)$")
+# AUTOBB (auto-posted big blind on joining/returning) and STRADDLE both appear in the
+# action region of real exports (56 occurrences across 14.5k hands) -- both are chips
+# into the pot, classified as one "post" action type.
+POST_RE = re.compile(r"^(?P<name>.+?): (?:AUTOBB|STRADDLE) (?P<amt_raw>.+)$")
+
+# Street banners carry trailing cards ("*** FLOP *** [Ts Jh 4h]") and appear both for
+# genuine betting streets and for the board runout of a called all-in (newer export
+# format); FIRST/SECOND variants come from run-it-twice hands. They start a new street;
+# any OTHER banner (SHOWDOWN, SUMMARY, and anything future) ends the action region.
+STREET_BANNER_RE = re.compile(r"^\*\*\* (?:FIRST |SECOND )?(?:FLOP|TURN|RIVER) \*\*\*")
+# A line shaped like an action ("name: verb ...") that _classify_action can't parse --
+# counted per actor so downstream money math can bail out honestly (see ParsedHand).
+ACTIONISH_RE = re.compile(r"^(?P<name>.+?): \S+")
 
 COLLECTED_RE = re.compile(r"^(?P<name>.+?) collected (?P<amt_raw>.+) from pot$", re.MULTILINE)
+# Shown hole cards: the showdown region's "X: shows [A B] (One Pair)" line, with the
+# summary's "Seat N: X showed [A B] and won/lost ..." as a fallback for names that
+# never got a shows-line (e.g. the winner of an uncalled shove). Not end-anchored --
+# both carry trailing hand-strength text.
+SHOWS_RE = re.compile(r"^(?P<name>.+?): shows \[(?P<c1>\w+) (?P<c2>\w+)\]", re.MULTILINE)
+SUMMARY_SHOWED_RE = re.compile(r"^Seat \d+: (?P<name>.+?) showed \[(?P<c1>\w+) (?P<c2>\w+)\]", re.MULTILINE)
 TOTAL_POT_RE = re.compile(
     r"^Total pot (?P<pot_raw>\S+)(?: \| Rake (?P<rake_raw>\S+))?(?: \| Splash Fee (?P<splash_raw>\S+))?$",
     re.MULTILINE,
@@ -73,7 +92,7 @@ class Seat:
 @dataclass(frozen=True)
 class PreflopAction:
     name: str
-    action: str  # "folds" | "checks" | "calls" | "bets" | "raises" | "allin" | "return"
+    action: str  # "folds" | "checks" | "calls" | "bets" | "raises" | "allin" | "return" | "post"
     to_amount: float | None  # "to" amount for raises; the stated amount otherwise; None for folds/checks
 
 
@@ -95,7 +114,15 @@ class ParsedHand:
     hero_name: str | None = None
     hero_cards: tuple[str, str] | None = None
     preflop_actions: list[PreflopAction] = field(default_factory=list)
-    collected_by: dict[str, float] = field(default_factory=dict)  # currency amounts, from SUMMARY/SHOWDOWN
+    postflop_streets: list[list[PreflopAction]] = field(default_factory=list)  # one list per
+    # street banner; EMPTY lists for the runout streets of a called all-in
+    unclassified_action_names: list[str] = field(default_factory=list)  # actors of action-shaped
+    # lines the classifier couldn't parse -- money math for those actors is untrustworthy
+    collected_by: dict[str, float] = field(default_factory=dict)  # currency amounts, from SUMMARY/SHOWDOWN,
+    # SUMMED per name (run-it-twice hands collect once per board)
+    shown_cards: dict[str, tuple[str, str]] = field(default_factory=dict)  # name -> hole cards
+    # revealed at showdown (SHOWS_RE, SUMMARY_SHOWED_RE); one entry per name even when
+    # a run-it-twice hand prints the shows-line once per board
     total_pot: float | None = None  # currency, from "Total pot X | Rake Y | Splash Fee Z"
     rake: float | None = None
     splash_fee: float = 0.0
@@ -137,6 +164,8 @@ def _classify_action(line: str) -> PreflopAction | None:
         return PreflopAction(m.group("name"), "calls", parse_amount(m.group("amt_raw")))
     if m := BET_RE.match(line):
         return PreflopAction(m.group("name"), "bets", parse_amount(m.group("amt_raw")))
+    if m := POST_RE.match(line):
+        return PreflopAction(m.group("name"), "post", parse_amount(m.group("amt_raw")))
     return None
 
 
@@ -194,17 +223,42 @@ def parse_hand(hand_text: str) -> ParsedHand:
             hero_cards = (m.group("c1"), m.group("c2"))
         i += 1
 
+    # Action region: preflop actions, then one bucket per street banner (runout-only
+    # streets simply stay empty). Any non-street banner (SHOWDOWN/SUMMARY/unknown)
+    # ends the region -- verified against real exports that RETURN never appears
+    # after those banners. Action-shaped lines the classifier can't parse are
+    # recorded by actor instead of silently dropped.
+    streets: list[list[PreflopAction]] = [preflop_actions]
+    unclassified_action_names: list[str] = []
     while i < n:
         line = lines[i]
-        if ANY_BANNER_RE.match(line):
+        if STREET_BANNER_RE.match(line):
+            streets.append([])
+        elif ANY_BANNER_RE.match(line):
             break
-        action = _classify_action(line)
-        if action is not None:
-            preflop_actions.append(action)
+        else:
+            action = _classify_action(line)
+            if action is not None:
+                streets[-1].append(action)
+            elif m := ACTIONISH_RE.match(line):
+                unclassified_action_names.append(m.group("name"))
         i += 1
+    postflop_streets = streets[1:]
 
     stripped_text = "\n".join(lines)
-    collected_by = {m.group("name"): parse_amount(m.group("amt_raw")) for m in COLLECTED_RE.finditer(stripped_text)}
+    collected_by: dict[str, float] = {}
+    for m in COLLECTED_RE.finditer(stripped_text):
+        name = m.group("name")
+        collected_by[name] = collected_by.get(name, 0.0) + parse_amount(m.group("amt_raw"))
+    # setdefault gives all three semantics at once: run-it-twice duplicate shows-lines
+    # dedup, the showdown-region line wins over a conflicting summary line, and the
+    # summary "showed" fills names that never got a shows-line.
+    shown_cards: dict[str, tuple[str, str]] = {}
+    for m in SHOWS_RE.finditer(stripped_text):
+        shown_cards.setdefault(m.group("name"), (m.group("c1"), m.group("c2")))
+    for m in SUMMARY_SHOWED_RE.finditer(stripped_text):
+        shown_cards.setdefault(m.group("name"), (m.group("c1"), m.group("c2")))
+
     total_pot: float | None = None
     rake: float | None = None
     splash_fee = 0.0
@@ -230,7 +284,10 @@ def parse_hand(hand_text: str) -> ParsedHand:
         hero_name=hero_name,
         hero_cards=hero_cards,
         preflop_actions=preflop_actions,
+        postflop_streets=postflop_streets,
+        unclassified_action_names=unclassified_action_names,
         collected_by=collected_by,
+        shown_cards=shown_cards,
         total_pot=total_pot,
         rake=rake,
         splash_fee=splash_fee,

@@ -92,7 +92,7 @@ def find_spot(hand: ParsedHand, hero_name: str = "Hero") -> tuple[PushFoldSpot |
 
         if action.action == "return":
             continue
-        if action.action in ("checks", "bets"):
+        if action.action in ("checks", "bets", "post"):
             return None, "non_allin_action"
 
         is_full_shove = action.action == "allin" or (
@@ -164,7 +164,7 @@ def classify_sb_open_when_hero_is_bb(hand: ParsedHand, hero_name: str = "Hero") 
         name = action.name
         if action.action == "return":
             continue
-        if action.action in ("checks", "bets"):
+        if action.action in ("checks", "bets", "post"):
             return None
         is_full_shove = _is_full_shove(action, stack_of)
         is_non_allin_raise = action.action == "raises" and not is_full_shove
@@ -221,7 +221,7 @@ def classify_bb_response_when_hero_is_sb(hand: ParsedHand, hero_name: str = "Her
                 return "call"
             return None
 
-        if action.action in ("checks", "bets"):
+        if action.action in ("checks", "bets", "post"):
             return None
         is_full_shove = _is_full_shove(action, stack_of)
         is_non_allin_raise = action.action == "raises" and not is_full_shove

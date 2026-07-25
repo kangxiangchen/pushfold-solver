@@ -239,3 +239,164 @@ def test_parse_file_never_aborts_on_one_bad_hand(tmp_path):
     assert len(hands) == 1
     assert len(failures) == 1
     assert failures[0][0] == "999"
+
+
+# ---------------------------------------------------------------------------------
+# All-street parsing (v2): postflop actions per street, run-twice collect sums,
+# AUTOBB/STRADDLE posts, unclassified-line safety net.
+# ---------------------------------------------------------------------------------
+
+SAMPLE_5_POSTFLOP_BETTING = """\
+CoinPoker Hand #99000001: NLH (₮0.25/₮0.50) 2026/07/08 20:30:00 +08
+Table '300100' 4-max Seat #1 is the button
+Seat 1: v1 (₮50 in chips)
+Seat 2: Hero (₮50 in chips)
+v1: posts small blind ₮0.25
+Hero: posts big blind ₮0.50
+*** HOLE CARDS ***
+Dealt to v1
+Dealt to Hero [Ah Kd]
+v1: calls ₮0.25
+Hero: checks
+*** FLOP *** [Ac 7d 2s]
+Hero: bets ₮0.50
+v1: calls ₮0.50
+*** TURN *** [Ac 7d 2s] [9h]
+Hero: checks
+v1: bets ₮1
+Hero: raises ₮2 to ₮3
+v1: folds
+Hero: RETURN ₮2
+*** SHOWDOWN ***
+Hero collected ₮3.80 from pot
+*** SUMMARY ***
+Total pot ₮4 | Rake ₮0.11 | Splash Fee ₮0.09
+Hand was run once
+Board [ Ac 7d 2s 9h ]
+Game ended: 2026/07/08 20:30:40 +08
+Seat 2: Hero won (₮3.80)
+Seat 1: v1 folded on the Turn
+"""
+
+SAMPLE_6_RUN_TWICE_TWO_COLLECTS = """\
+CoinPoker Hand #99000002: NLH (₮0.25/₮0.50) 2026/07/08 20:31:00 +08
+Table '300100' 4-max Seat #1 is the button
+Seat 1: v1 (₮10 in chips)
+Seat 2: Hero (₮10 in chips)
+v1: posts small blind ₮0.25
+Hero: posts big blind ₮0.50
+*** HOLE CARDS ***
+Dealt to v1
+Dealt to Hero [As Ad]
+v1: ALLIN ₮9.75
+Hero: ALLIN ₮9.50
+*** FIRST FLOP *** [2c 7d 9s]
+*** FIRST TURN *** [2c 7d 9s] [Jh]
+*** FIRST RIVER *** [2c 7d 9s Jh] [3d]
+*** SECOND FLOP *** [4h 8c Qd]
+*** SECOND TURN *** [4h 8c Qd] [5s]
+*** SECOND RIVER *** [4h 8c Qd 5s] [6c]
+*** FIRST SHOWDOWN ***
+Hero: shows [As Ad] (One Pair)
+Hero collected ₮9.78 from pot
+*** SECOND SHOWDOWN ***
+Hero: shows [As Ad] (One Pair)
+Hero collected ₮9.78 from pot
+*** SUMMARY ***
+Total pot ₮20 | Rake ₮0.24 | Splash Fee ₮0.20
+Hand was run twice
+Game ended: 2026/07/08 20:31:30 +08
+Seat 2: Hero showed [As Ad] and won (₮19.56)
+Seat 1: v1 showed [Kc Kh] and lost
+"""
+
+
+def test_sample_5_postflop_streets_parsed_and_preflop_unchanged():
+    hand = parse_hand(SAMPLE_5_POSTFLOP_BETTING)
+    assert [(a.name, a.action) for a in hand.preflop_actions] == [
+        ("v1", "calls"), ("Hero", "checks"),
+    ]
+    assert len(hand.postflop_streets) == 2
+    flop, turn = hand.postflop_streets
+    assert [(a.name, a.action, a.to_amount) for a in flop] == [
+        ("Hero", "bets", 0.5), ("v1", "calls", 0.5),
+    ]
+    assert [(a.name, a.action) for a in turn] == [
+        ("Hero", "checks"), ("v1", "bets"), ("Hero", "raises"), ("v1", "folds"), ("Hero", "return"),
+    ]
+    assert hand.unclassified_action_names == []
+
+
+def test_sample_2_runout_banners_produce_empty_postflop_streets():
+    # A called all-in runs out FLOP/TURN/RIVER banners with no betting on them --
+    # they must parse as (empty) streets, not end the action region or leak lines.
+    hand = parse_hand(SAMPLE_2_GRADABLE_BB_CALL)
+    assert len(hand.postflop_streets) == 3
+    assert all(street == [] for street in hand.postflop_streets)
+    assert [(a.name, a.action) for a in hand.preflop_actions] == [
+        ("14cee93d", "allin"), ("8c6b9c2c", "folds"), ("Hero", "allin"),
+    ]
+
+
+def test_sample_6_collected_by_sums_across_run_twice_boards():
+    hand = parse_hand(SAMPLE_6_RUN_TWICE_TWO_COLLECTS)
+    assert hand.collected_by["Hero"] == 19.56
+    assert len(hand.postflop_streets) == 6  # six runout street banners, all empty
+    assert all(street == [] for street in hand.postflop_streets)
+
+
+def test_autobb_and_straddle_classify_as_posts():
+    text = SAMPLE_5_POSTFLOP_BETTING.replace(
+        "v1: calls ₮0.25", "v1: STRADDLE ₮1\nv1: calls ₮0.25"
+    ).replace("Hero: checks", "Hero: AUTOBB ₮0.50\nHero: checks")
+    hand = parse_hand(text)
+    posts = [(a.name, a.action, a.to_amount) for a in hand.preflop_actions if a.action == "post"]
+    assert posts == [("v1", "post", 1.0), ("Hero", "post", 0.5)]
+    assert hand.unclassified_action_names == []
+
+
+def test_unknown_action_verbs_are_counted_not_swallowed():
+    text = SAMPLE_5_POSTFLOP_BETTING.replace(
+        "Hero: checks\n*** FLOP", "Hero: timebanks ₮1\nHero: checks\n*** FLOP"
+    )
+    hand = parse_hand(text)
+    assert "Hero" in hand.unclassified_action_names
+
+
+# ---------------------------------------------------------------------------------
+# Shown villain cards (v3): "X: shows [A B]" showdown lines with the summary
+# "showed [A B]" fallback; run-it-twice duplicates dedup to one entry.
+# ---------------------------------------------------------------------------------
+
+
+def test_shown_cards_from_showdown_region():
+    hand = parse_hand(SAMPLE_2_GRADABLE_BB_CALL)
+    assert hand.shown_cards == {"Hero": ("8h", "As"), "14cee93d": ("6h", "Ad")}
+    assert "8c6b9c2c" not in hand.shown_cards  # folded, never shown
+    assert hand.shown_cards["Hero"] == hand.hero_cards
+
+
+def test_shown_cards_run_twice_dedup_and_summary_fallback():
+    hand = parse_hand(SAMPLE_6_RUN_TWICE_TWO_COLLECTS)
+    # Hero's shows-line appears under both FIRST and SECOND SHOWDOWN -> one entry;
+    # v1's cards exist only in the summary "showed [Kc Kh]" line -> fallback fills it.
+    assert hand.shown_cards == {"Hero": ("As", "Ad"), "v1": ("Kc", "Kh")}
+
+
+def test_shown_cards_summary_only_uncalled_shove():
+    hand = parse_hand(SAMPLE_3_SHOVE_MULTIWAY)
+    assert hand.shown_cards == {"Hero": ("As", "8d")}
+
+
+def test_shown_cards_shows_line_wins_over_conflicting_summary():
+    text = SAMPLE_2_GRADABLE_BB_CALL.replace(
+        "Seat 1: 14cee93d showed [6h Ad] and lost with One Pair",
+        "Seat 1: 14cee93d showed [2c 2d] and lost with One Pair",
+    )
+    hand = parse_hand(text)
+    assert hand.shown_cards["14cee93d"] == ("6h", "Ad")
+
+
+def test_shown_cards_empty_when_nobody_shows():
+    hand = parse_hand(SAMPLE_5_POSTFLOP_BETTING)
+    assert hand.shown_cards == {}

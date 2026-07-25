@@ -97,3 +97,16 @@ def next_seat(cfg: GameConfig, infoset: InfoSet) -> str | None:
     if infoset.is_last_seat:
         return None
     return cfg.seats[infoset.seat_pos + 1]
+
+
+def infoset_description(cfg, infoset: InfoSet) -> str:
+    """Plain-English situation line, e.g. 'BB call vs UTG + SB shoves (BTN folded)'.
+    Lives here (pure structure -> text) so dashboard code can describe info sets
+    without importing viz/matplotlib; scripts/export_range_viewer.py aliases it."""
+    order = {s: i for i, s in enumerate(cfg.seats)}
+    shovers = sorted(infoset.shoved_before, key=order.get)
+    folded = [s for s in cfg.seats[: infoset.seat_pos] if s not in infoset.shoved_before]
+    folded_note = f" ({', '.join(folded)} folded)" if folded else ""
+    if not shovers:
+        return f"{infoset.seat} open-shove{folded_note or ' (first to act)'}"
+    return f"{infoset.seat} call vs {' + '.join(shovers)} shove{'s' if len(shovers) > 1 else ''}{folded_note}"

@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from fourmax_spot import find_fourmax_spot
+from fourmax_spot import FourmaxRealization, classify_fourmax_realization, find_fourmax_spot
 from hand_history import parse_hand
 from pushfold_spot import PushFoldSpot
 from test_hand_history import SAMPLE_4_ANTE_SKIP
@@ -229,3 +229,64 @@ def test_ante_hand_skipped():
     spot, reason = find_fourmax_spot(parse_hand(SAMPLE_4_ANTE_SKIP))
     assert spot is None
     assert reason == "ante_present"
+
+
+# ---------------------------------------------------------------------------------
+# classify_fourmax_realization: the full-hand walk (past hero's decision) that the
+# realized-EV leg needs -- which roles ended up genuinely all-in and which folded
+# after hero, so the realized leaf shape mirrors ev.py's conventions.
+# ---------------------------------------------------------------------------------
+
+POST_FOLD_LIMP = """\
+CoinPoker Hand #700000008: NLH (₮1/₮2) 2026/01/01 01:00:07 +08
+Table 'test' 4-max Seat #2 is the button
+Seat 1: Hero (₮16 in chips)
+Seat 2: Btnp (₮16 in chips)
+Seat 3: Sbp (₮16 in chips)
+Seat 4: Bbp (₮16 in chips)
+Sbp: posts small blind ₮1
+Bbp: posts big blind ₮2
+*** HOLE CARDS ***
+Dealt to Hero [Ah Kh]
+Dealt to Btnp
+Dealt to Sbp
+Dealt to Bbp
+Hero: folds
+Btnp: calls ₮2
+Sbp: folds
+Bbp: checks
+*** SHOWDOWN ***
+Bbp collected ₮4 from pot
+*** SUMMARY ***
+Total pot ₮5 | Rake ₮0
+"""
+
+
+def test_realization_open_steal():
+    r = classify_fourmax_realization(parse_hand(BTN_SHOVES_AFTER_UTG_FOLDS))
+    assert r == FourmaxRealization("BTN", "shove_or_call", frozenset(), ("SB", "BB"))
+
+
+def test_realization_multiway_call_counts_closing_caller_as_live():
+    r = classify_fourmax_realization(parse_hand(BB_FACES_MULTIWAY_SHOVE))
+    assert r == FourmaxRealization("BB", "shove_or_call", frozenset({"UTG", "BTN"}), ())
+
+
+def test_realization_fold_with_shove_behind():
+    r = classify_fourmax_realization(parse_hand(BTN_FOLDS_TO_UTG_SHOVE))
+    assert r == FourmaxRealization("BTN", "fold", frozenset({"UTG"}), ("SB", "BB"))
+
+
+def test_realization_open_fold_walk():
+    # BB never acts in an all-fold walk, so it appears in neither set.
+    r = classify_fourmax_realization(parse_hand(UTG_FOLDS))
+    assert r == FourmaxRealization("UTG", "fold", frozenset(), ("BTN", "SB"))
+
+
+def test_realization_unmappable_continuation_returns_none():
+    # A post-hero limp/check isn't representable in the shove-or-fold model.
+    assert classify_fourmax_realization(parse_hand(POST_FOLD_LIMP)) is None
+
+
+def test_realization_ante_hand_returns_none():
+    assert classify_fourmax_realization(parse_hand(SAMPLE_4_ANTE_SKIP)) is None

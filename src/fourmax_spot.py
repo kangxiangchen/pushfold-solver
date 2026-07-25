@@ -27,6 +27,8 @@ solve (at 8.0bb) is needed to grade all of them, not a per-hand depth sweep.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from game import FOURMAX_CONFIG
 from hand_history import ParsedHand
 from pushfold_spot import MAX_PUSHFOLD_STACK_BB, PushFoldSpot, _is_full_shove
@@ -103,7 +105,7 @@ def find_fourmax_spot(hand: ParsedHand, hero_name: str = "Hero") -> tuple[PushFo
         if role is None:
             return None, "unknown_actor"
 
-        if action.action in ("checks", "bets"):
+        if action.action in ("checks", "bets", "post"):
             return None, "non_allin_action"
 
         is_full_shove = _is_full_shove(action, stack_of)
@@ -131,3 +133,76 @@ def find_fourmax_spot(hand: ParsedHand, hero_name: str = "Hero") -> tuple[PushFo
             continue
 
     return None, "no_gradable_decision"
+
+
+@dataclass(frozen=True)
+class FourmaxRealization:
+    """How one hand ACTUALLY resolved, in model terms -- the counterpart of a single
+    leaf from ev._enumerate_realization_leaves, observed instead of enumerated.
+    Everything the realized-EV leg needs beyond hero's own PushFoldSpot."""
+
+    hero_role: str
+    hero_action: str  # "fold" | "shove_or_call"
+    live_others: frozenset[str]  # roles genuinely all-in at hand end, hero excluded
+    folded_after: tuple[str, ...]  # roles that folded AFTER hero's decision (their
+    # blinds are dead money on top of the info set's own pre-hero dead_money_bb)
+
+
+def classify_fourmax_realization(hand: ParsedHand, hero_name: str = "Hero") -> FourmaxRealization | None:
+    """Mirrors find_fourmax_spot's walk but continues past hero's decision to the end
+    of preflop, reporting which roles ended up all-in and which folded behind hero.
+    None when the hand doesn't reduce to pure shove-or-fold END TO END -- villains
+    are free to limp/min-raise after hero folds, and such a continuation has no leaf
+    in the model, so the spot keeps its grade but gets no realized-EV leg. Same
+    guards as find_fourmax_spot (antes, unknown actors, role overflow)."""
+    if hand.ante_posters or hand.sb_poster is None or hand.bb_poster is None:
+        return None
+    roles = _assign_fourmax_roles(hand)
+    if roles is None or hero_name not in roles:
+        return None
+
+    stack_of = {s.name: s.starting_stack for s in hand.seats}
+    shoved_roles: set[str] = set()
+    folded_after: list[str] = []
+    hero_action: str | None = None
+
+    for action in hand.preflop_actions:
+        if action.action == "return":
+            continue
+        role = roles.get(action.name)
+        if role is None:
+            return None
+        if action.action in ("checks", "bets", "post"):
+            return None
+
+        is_full_shove = _is_full_shove(action, stack_of)
+        is_closing_call = action.action == "calls" and bool(shoved_roles)
+        if (action.action == "raises" and not is_full_shove) or (action.action == "calls" and not shoved_roles):
+            return None
+
+        if action.action == "folds":
+            if action.name == hero_name:
+                if hero_action is not None:
+                    return None
+                hero_action = "fold"
+            elif hero_action is not None:
+                folded_after.append(role)
+            continue
+
+        if is_full_shove or is_closing_call:
+            if action.name == hero_name:
+                if hero_action is not None:
+                    return None
+                hero_action = "shove_or_call"
+            shoved_roles.add(role)
+            continue
+
+    if hero_action is None:
+        return None
+    hero_role = roles[hero_name]
+    return FourmaxRealization(
+        hero_role=hero_role,
+        hero_action=hero_action,
+        live_others=frozenset(shoved_roles - {hero_role}),
+        folded_after=tuple(folded_after),
+    )

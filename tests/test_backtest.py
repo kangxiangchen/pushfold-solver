@@ -85,3 +85,28 @@ def test_grade_spot_against_works_for_fourmax_config():
         assert graded.position == spot.info_set_key.split("|", 1)[0]
         if graded.hero_action == graded.gto_recommended_action:
             assert graded.ev_loss_bb == pytest.approx(0.0, abs=1e-9)
+
+
+def test_grade_spot_against_ev_memo_reuses_vectors_across_spots():
+    # A genuine 3-way multiway leaf: computing its EV vector needs an evaluator.
+    # After the first (memo-populating) call, an identical-infoset spot must grade
+    # WITHOUT one -- proof the vector was served from the memo, not recomputed --
+    # and hand-dependent outputs must still differ per hero hand.
+    fake_evaluator = _FakeEvaluator()
+    ranges, _info = solver.solve(FOURMAX_CONFIG, FAST_SOLVER_CFG, table=SYNTHETIC_TABLE, evaluator=fake_evaluator)
+
+    memo: dict = {}
+    first = grade_spot_against(
+        PushFoldSpot("h1", "t1", "BB|BTN|SB|UTG", ("7c", "2d"), 8.0, "fold"),
+        FOURMAX_CONFIG, ranges, SYNTHETIC_TABLE, evaluator=fake_evaluator, model="4MAX", ev_memo=memo)
+    assert ("4MAX", FOURMAX_CONFIG.stack_bb, "BB|BTN|SB|UTG") in memo
+
+    again = grade_spot_against(
+        PushFoldSpot("h1", "t1", "BB|BTN|SB|UTG", ("7c", "2d"), 8.0, "fold"),
+        FOURMAX_CONFIG, ranges, SYNTHETIC_TABLE, evaluator=None, model="4MAX", ev_memo=memo)
+    assert again == first  # same memoized vector -> bit-identical grade
+
+    other_hand = grade_spot_against(
+        PushFoldSpot("h2", "t2", "BB|BTN|SB|UTG", ("Ah", "Ad"), 8.0, "fold"),
+        FOURMAX_CONFIG, ranges, SYNTHETIC_TABLE, evaluator=None, model="4MAX", ev_memo=memo)
+    assert other_hand.predicted_ev_net_bb != first.predicted_ev_net_bb or other_hand.gto_weight != first.gto_weight
