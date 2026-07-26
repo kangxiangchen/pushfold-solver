@@ -8,3 +8,6 @@ data/
 .DS_Store
 .claude/
 .coverage
+# personal career/handoff docs -- never publish
+RESUME_*.md
+*_HANDOFF.md
